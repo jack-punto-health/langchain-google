@@ -6,6 +6,8 @@ from google.cloud.aiplatform.matching_engine.matching_engine_index_endpoint impo
     Namespace,
     NumericNamespace,
 )
+from google.oauth2.service_account import Credentials
+from langchain_core._api.deprecation import deprecated
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
@@ -29,7 +31,8 @@ class _BaseVertexAIVectorStore(VectorStore):
         self,
         searcher: Searcher,
         document_storage: DocumentStorage,
-        embbedings: Optional[Embeddings] = None,
+        embbedings: Optional[Embeddings] = None,  # Deprecated parameter
+        embeddings: Optional[Embeddings] = None,
     ) -> None:
         """Constructor.
 
@@ -37,15 +40,33 @@ class _BaseVertexAIVectorStore(VectorStore):
             searcher: Object in charge of searching and storing the index.
             document_storage: Object in charge of storing and retrieving documents.
             embbedings: Object in charge of transforming text to embbeddings.
+                Deprecated: Use 'embeddings' instead.
+            embeddings: Object in charge of transforming text to embeddings.
         """
         super().__init__()
         self._searcher = searcher
         self._document_storage = document_storage
-        self._embeddings = embbedings or self._get_default_embeddings()
+
+        # Add explicit warning when the misspelled parameter is used
+        if embbedings is not None:
+            warnings.warn(
+                message=(
+                    "The parameter `embbedings` is deprecated due to a spelling error. "
+                    "Please use `embeddings` instead. "
+                    "Support for `embbedings` will be removed in a future version."
+                ),
+                category=DeprecationWarning,
+            )
+        self._embeddings = embeddings or embbedings or self._get_default_embeddings()
 
     @property
+    @deprecated(since="0.1.0", removal="3.0.0", alternative="embeddings")
     def embbedings(self) -> Embeddings:
         """Returns the embeddings object."""
+        return self._embeddings
+
+    @property
+    def embeddings(self) -> Embeddings:
         return self._embeddings
 
     def similarity_search_with_score(  # type: ignore[override]
@@ -316,8 +337,8 @@ class _BaseVertexAIVectorStore(VectorStore):
             )
 
         documents = [
-            Document(page_content=text, metadata=metadata)
-            for text, metadata in zip(texts, metadatas)
+            Document(id=id_, page_content=text, metadata=metadata)
+            for id_, text, metadata in zip(ids, texts, metadatas)
         ]
 
         self._document_storage.mset(list(zip(ids, documents)))
@@ -358,14 +379,14 @@ class _BaseVertexAIVectorStore(VectorStore):
 
         warnings.warn(
             message=(
-                "`TensorflowHubEmbeddings` as a default embbedings is deprecated."
-                " Will change to `VertexAIEmbbedings`. Please specify the embedding "
+                "`TensorflowHubEmbeddings` as a default embeddings is deprecated."
+                " Will change to `VertexAIEmbeddings`. Please specify the embedding "
                 "type in the constructor."
             ),
             category=DeprecationWarning,
         )
 
-        # TODO: Change to vertexai embbedingss
+        # TODO: Change to vertexai embeddings
         from langchain_community.embeddings import (  # type: ignore[import-not-found, unused-ignore]
             TensorflowHubEmbeddings,
         )
@@ -398,6 +419,7 @@ class VectorSearchVectorStore(_BaseVertexAIVectorStore):
         index_id: str,
         endpoint_id: str,
         private_service_connect_ip_address: Optional[str] = None,
+        credentials: Optional[Credentials] = None,
         credentials_path: Optional[str] = None,
         embedding: Optional[Embeddings] = None,
         stream_update: bool = False,
@@ -415,6 +437,7 @@ class VectorSearchVectorStore(_BaseVertexAIVectorStore):
             endpoint_id: The id of the created endpoint.
             private_service_connect_ip_address: The IP address of the private
             service connect instance.
+            credentials: Google cloud Credentials object.
             credentials_path: (Optional) The path of the Google credentials on
             the local file system.
             embedding: The :class:`Embeddings` that will be used for
@@ -429,7 +452,10 @@ class VectorSearchVectorStore(_BaseVertexAIVectorStore):
         """
 
         sdk_manager = VectorSearchSDKManager(
-            project_id=project_id, region=region, credentials_path=credentials_path
+            project_id=project_id,
+            region=region,
+            credentials=credentials,
+            credentials_path=credentials_path,
         )
         bucket = sdk_manager.get_gcs_bucket(bucket_name=gcs_bucket_name)
         index = sdk_manager.get_index(index_id=index_id)
@@ -448,7 +474,7 @@ class VectorSearchVectorStore(_BaseVertexAIVectorStore):
                 staging_bucket=bucket,
                 stream_update=stream_update,
             ),
-            embbedings=embedding,
+            embeddings=embedding,
         )
 
 
@@ -469,6 +495,7 @@ class VectorSearchVectorStoreDatastore(_BaseVertexAIVectorStore):
         index_id: str,
         endpoint_id: str,
         index_staging_bucket_name: Optional[str] = None,
+        credentials: Optional[Credentials] = None,
         credentials_path: Optional[str] = None,
         embedding: Optional[Embeddings] = None,
         stream_update: bool = False,
@@ -490,6 +517,7 @@ class VectorSearchVectorStoreDatastore(_BaseVertexAIVectorStore):
             index_staging_bucket_name: (Optional) If the index is updated by batch,
                 bucket where the data will be staged before updating the index. Only
                 required when updating the index.
+            credentials: Google cloud Credentials object.
             credentials_path: (Optional) The path of the Google credentials on
             the local file system.
             embedding: The :class:`Embeddings` that will be used for
@@ -505,11 +533,10 @@ class VectorSearchVectorStoreDatastore(_BaseVertexAIVectorStore):
         """
 
         sdk_manager = VectorSearchSDKManager(
-            project_id=project_id, region=region, credentials_path=credentials_path
-        )
-
-        sdk_manager = VectorSearchSDKManager(
-            project_id=project_id, region=region, credentials_path=credentials_path
+            project_id=project_id,
+            region=region,
+            credentials=credentials,
+            credentials_path=credentials_path,
         )
 
         if index_staging_bucket_name is not None:
@@ -543,5 +570,5 @@ class VectorSearchVectorStoreDatastore(_BaseVertexAIVectorStore):
                 staging_bucket=bucket,
                 stream_update=stream_update,
             ),
-            embbedings=embedding,
+            embeddings=embedding,
         )

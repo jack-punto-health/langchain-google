@@ -1,6 +1,7 @@
 """Test chat model integration."""
 
 import asyncio
+import base64
 import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Union
@@ -24,13 +25,15 @@ from langchain_core.messages import (
 )
 from langchain_core.messages.tool import tool_call as create_tool_call
 from pydantic import SecretStr
+from pydantic_core._pydantic_core import ValidationError
 from pytest import CaptureFixture
 
 from langchain_google_genai.chat_models import (
     ChatGoogleGenerativeAI,
-    _convert_tool_message_to_part,
+    _convert_tool_message_to_parts,
     _parse_chat_history,
     _parse_response_candidate,
+    _response_to_result,
 )
 
 
@@ -47,7 +50,7 @@ def test_integration_initialization() -> None:
     ls_params = llm._get_ls_params()
     assert ls_params == {
         "ls_provider": "google_genai",
-        "ls_model_name": "models/gemini-nano",
+        "ls_model_name": "gemini-nano",
         "ls_model_type": "chat",
         "ls_temperature": 0.7,
     }
@@ -60,7 +63,7 @@ def test_integration_initialization() -> None:
     ls_params = llm._get_ls_params()
     assert ls_params == {
         "ls_provider": "google_genai",
-        "ls_model_name": "models/gemini-nano",
+        "ls_model_name": "gemini-nano",
         "ls_model_type": "chat",
         "ls_temperature": 0.7,
         "ls_max_tokens": 10,
@@ -73,6 +76,21 @@ def test_integration_initialization() -> None:
         top_p=1,
         temperature=0.7,
     )
+
+    # test initialization with an invalid argument to check warning
+    with patch("langchain_google_genai.chat_models.logger.warning") as mock_warning:
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-nano",
+            google_api_key=SecretStr("..."),  # type: ignore[call-arg]
+            safety_setting={
+                "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_LOW_AND_ABOVE"
+            },  # Invalid arg
+        )
+        assert llm.model == "models/gemini-nano"
+        mock_warning.assert_called_once()
+        call_args = mock_warning.call_args[0][0]
+        assert "Unexpected argument 'safety_setting'" in call_args
+        assert "Did you mean: 'safety_settings'?" in call_args
 
 
 def test_initialization_inside_threadpool() -> None:
@@ -395,6 +413,62 @@ def test_additional_headers_support(headers: Optional[Dict[str, str]]) -> None:
                 "content": {
                     "parts": [
                         {
+                            "inline_data": {
+                                "mime_type": "image/bmp",
+                                "data": base64.b64decode(
+                                    "Qk0eAAAAAAAAABoAAAAMAAAAAQABAAEAGAAAAP8A"
+                                ),
+                            }
+                        }
+                    ]
+                }
+            },
+            AIMessage(
+                content=[
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/bmp;base64,"
+                            + "Qk0eAAAAAAAAABoAAAAMAAAAAQABAAEAGAAAAP8A"
+                        },
+                    }
+                ]
+            ),
+        ),
+        (
+            {
+                "content": {
+                    "parts": [
+                        {"text": "This is a 1x1 BMP."},
+                        {
+                            "inline_data": {
+                                "mime_type": "image/bmp",
+                                "data": base64.b64decode(
+                                    "Qk0eAAAAAAAAABoAAAAMAAAAAQABAAEAGAAAAP8A"
+                                ),
+                            }
+                        },
+                    ]
+                }
+            },
+            AIMessage(
+                content=[
+                    "This is a 1x1 BMP.",
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/bmp;base64,"
+                            + "Qk0eAAAAAAAAABoAAAAMAAAAAQABAAEAGAAAAP8A"
+                        },
+                    },
+                ]
+            ),
+        ),
+        (
+            {
+                "content": {
+                    "parts": [
+                        {
                             "function_call": glm.FunctionCall(
                                 name="Information", args={"name": "Ben"}
                             )
@@ -637,9 +711,162 @@ def test_serialize() -> None:
         ),
     ],
 )
-def test__convert_tool_message_to_part__sets_tool_name(
+def test__convert_tool_message_to_parts__sets_tool_name(
     tool_message: ToolMessage,
 ) -> None:
-    part = _convert_tool_message_to_part(tool_message)
+    parts = _convert_tool_message_to_parts(tool_message)
+    assert len(parts) == 1
+    part = parts[0]
     assert part.function_response.name == "tool_name"
     assert part.function_response.response == {"output": "test_content"}
+
+
+def test_temperature_range_pydantic_validation() -> None:
+    """Test that temperature is in the range [0.0, 2.0]"""
+
+    with pytest.raises(ValidationError):
+        ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=2.1)
+
+    with pytest.raises(ValidationError):
+        ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=-0.1)
+
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash",
+        google_api_key=SecretStr("..."),  # type: ignore[call-arg]
+        temperature=1.5,
+    )
+    ls_params = llm._get_ls_params()
+    assert ls_params == {
+        "ls_provider": "google_genai",
+        "ls_model_name": "gemini-2.0-flash",
+        "ls_model_type": "chat",
+        "ls_temperature": 1.5,
+    }
+
+
+def test_temperature_range_model_validation() -> None:
+    """Test that temperature is in the range [0.0, 2.0]"""
+
+    with pytest.raises(ValueError):
+        ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=2.5)
+
+    with pytest.raises(ValueError):
+        ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=-0.5)
+
+
+def test_model_kwargs() -> None:
+    """Test we can transfer unknown params to model_kwargs."""
+    llm = ChatGoogleGenerativeAI(
+        model="my-model",
+        convert_system_message_to_human=True,
+        model_kwargs={"foo": "bar"},
+    )
+    assert llm.model == "models/my-model"
+    assert llm.convert_system_message_to_human is True
+    assert llm.model_kwargs == {"foo": "bar"}
+
+    with pytest.warns(match="transferred to model_kwargs"):
+        llm = ChatGoogleGenerativeAI(
+            model="my-model",
+            convert_system_message_to_human=True,
+            foo="bar",
+        )
+    assert llm.model == "models/my-model"
+    assert llm.convert_system_message_to_human is True
+    assert llm.model_kwargs == {"foo": "bar"}
+
+
+@pytest.mark.parametrize(
+    "raw_response, expected_grounding_metadata",
+    [
+        (
+            # Case 1: Response with grounding_metadata
+            {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "Test response"}]},
+                        "grounding_metadata": {
+                            "grounding_chunks": [
+                                {
+                                    "web": {
+                                        "uri": "https://example.com",
+                                        "title": "Example Site",
+                                    }
+                                }
+                            ],
+                            "grounding_supports": [
+                                {
+                                    "segment": {
+                                        "start_index": 0,
+                                        "end_index": 13,
+                                        "text": "Test response",
+                                    },
+                                    "grounding_chunk_indices": [0],
+                                    "confidence_scores": [0.95],
+                                }
+                            ],
+                            "web_search_queries": ["test query"],
+                        },
+                    }
+                ],
+                "prompt_feedback": {"block_reason": 0, "safety_ratings": []},
+                "usage_metadata": {
+                    "prompt_token_count": 10,
+                    "candidates_token_count": 5,
+                    "total_token_count": 15,
+                },
+            },
+            {
+                "grounding_chunks": [
+                    {"web": {"uri": "https://example.com", "title": "Example Site"}}
+                ],
+                "grounding_supports": [
+                    {
+                        "segment": {
+                            "start_index": 0,
+                            "end_index": 13,
+                            "text": "Test response",
+                            "part_index": 0,
+                        },
+                        "grounding_chunk_indices": [0],
+                        "confidence_scores": [0.95],
+                    }
+                ],
+                "web_search_queries": ["test query"],
+            },
+        ),
+        (
+            # Case 2: Response without grounding_metadata
+            {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "Test response"}]},
+                    }
+                ],
+                "prompt_feedback": {"block_reason": 0, "safety_ratings": []},
+                "usage_metadata": {
+                    "prompt_token_count": 10,
+                    "candidates_token_count": 5,
+                    "total_token_count": 15,
+                },
+            },
+            {},
+        ),
+    ],
+)
+def test_response_to_result_grounding_metadata(
+    raw_response: Dict, expected_grounding_metadata: Dict
+) -> None:
+    """Test that _response_to_result includes grounding_metadata in the response."""
+    response = GenerateContentResponse(raw_response)
+    result = _response_to_result(response, stream=False)
+
+    assert len(result.generations) == len(raw_response["candidates"])
+    for generation in result.generations:
+        assert generation.message.content == "Test response"
+        grounding_metadata = (
+            generation.generation_info.get("grounding_metadata", {})
+            if generation.generation_info is not None
+            else {}
+        )
+        assert grounding_metadata == expected_grounding_metadata

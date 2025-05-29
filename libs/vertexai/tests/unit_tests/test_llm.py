@@ -23,6 +23,22 @@ def test_model_name() -> None:
         assert llm.model_name == "gemini-pro"
         assert llm.max_output_tokens == 10
 
+    # Test initialization with an invalid argument to check warning
+    with patch("langchain_google_vertexai.llms.logger.warning") as mock_warning:
+        llm = VertexAI(
+            model_name="gemini-pro",
+            project="test-project",
+            safety_setting={
+                "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_LOW_AND_ABOVE"
+            },  # Invalid arg
+        )
+        assert llm.model_name == "gemini-pro"
+        assert llm.project == "test-project"
+        mock_warning.assert_called_once()
+        call_args = mock_warning.call_args[0][0]
+        assert "Unexpected argument 'safety_setting'" in call_args
+        assert "Did you mean: 'safety_settings'?" in call_args
+
 
 def test_tuned_model_name() -> None:
     llm = VertexAI(
@@ -46,6 +62,8 @@ def test_vertexai_args_passed() -> None:
         "temperature": 0,
         "top_k": 10,
         "top_p": 0.5,
+        "frequency_penalty": 0.2,
+        "presence_penalty": 0.3,
     }
 
     # Mock the library to ensure the args are passed correctly
@@ -62,7 +80,9 @@ def test_vertexai_args_passed() -> None:
         mock_prediction_service.return_value.generate_content = mock_generate_content
 
         llm = VertexAI(model_name="gemini-pro", **prompt_params)
-        response = llm.invoke(user_prompt, temperature=0.5)
+        response = llm.invoke(
+            user_prompt, temperature=0.5, frequency_penalty=0.5, presence_penalty=0.5
+        )
         assert response == response_text
         mock_generate_content.assert_called_once()
 
@@ -74,7 +94,13 @@ def test_vertexai_args_passed() -> None:
             == "Hello"
         )
         expected = GenerationConfig(
-            candidate_count=1, temperature=0.5, top_p=0.5, top_k=10, max_output_tokens=1
+            candidate_count=1,
+            temperature=0.5,
+            top_p=0.5,
+            top_k=10,
+            max_output_tokens=1,
+            frequency_penalty=0.5,
+            presence_penalty=0.5,
         )
         assert (
             mock_generate_content.call_args.kwargs["request"].generation_config

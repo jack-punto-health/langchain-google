@@ -2,6 +2,7 @@
 
 from __future__ import annotations  # noqa
 import ast
+import base64
 from functools import cached_property
 import json
 import logging
@@ -50,6 +51,8 @@ from langchain_core.messages import (
     SystemMessage,
     ToolCall,
     ToolMessage,
+    convert_to_openai_image_block,
+    is_data_content_block,
 )
 from langchain_core.messages.ai import UsageMetadata
 from langchain_core.messages.tool import (
@@ -67,8 +70,13 @@ from langchain_core.output_parsers.openai_tools import parse_tool_calls
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from pydantic import BaseModel, Field, model_validator
 from langchain_core.runnables import Runnable, RunnablePassthrough
-from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_core.utils import get_pydantic_field_names
+from langchain_core.utils.function_calling import (
+    convert_to_json_schema,
+    convert_to_openai_tool,
+)
 from langchain_core.utils.pydantic import is_basemodel_subclass
+from langchain_core.utils.utils import _build_model_kwargs
 from vertexai.generative_models import (  # type: ignore
     Tool as VertexTool,
 )
@@ -138,7 +146,9 @@ from langchain_google_vertexai.functions_utils import (
     _ToolType,
 )
 from pydantic import ConfigDict
-from typing_extensions import Self
+from pydantic.v1 import BaseModel as BaseModelV1
+from typing_extensions import Self, is_typeddict
+from difflib import get_close_matches
 
 
 logger = logging.getLogger(__name__)
@@ -158,6 +168,8 @@ _allowed_params = [
     "response_logprobs",
     "logprobs",
     "labels",
+    "audio_timestamp",
+    "thinking_budget",
 ]
 _allowed_params_prediction_service = ["request", "timeout", "metadata", "labels"]
 
@@ -229,6 +241,22 @@ def _parse_chat_history_gemini(
                 return Part(text=part["text"])
             else:
                 return None
+        if is_data_content_block(part):
+            # LangChain standard format
+            if part["type"] == "image" and part["source_type"] == "url":
+                oai_content_block = convert_to_openai_image_block(part)
+                url = oai_content_block["image_url"]["url"]
+                return imageBytesLoader.load_gapic_part(url)
+            elif part["source_type"] == "base64":
+                bytes_ = base64.b64decode(part["data"])
+            else:
+                raise ValueError("source_type must be url or base64.")
+            inline_data: dict = {"data": bytes_}
+            if "mime_type" in part:
+                inline_data["mime_type"] = part["mime_type"]
+
+            return Part(inline_data=Blob(**inline_data))
+
         if part["type"] == "image_url":
             path = part["image_url"]["url"]
             return imageBytesLoader.load_gapic_part(path)
@@ -534,16 +562,8 @@ def _parse_response_candidate(
                 raise Exception("Unexpected content type")
 
         if part.function_call:
-            if "function_call" in additional_kwargs:
-                logger.warning(
-                    (
-                        "This model can reply with multiple "
-                        "function calls in one response. "
-                        "Please don't rely on `additional_kwargs.function_call` "
-                        "as only the last one will be saved."
-                        "Use `tool_calls` instead."
-                    )
-                )
+            # For backward compatibility we store a function call in additional_kwargs,
+            # but in general the full set of function calls is stored in tool_calls.
             function_call = {"name": part.function_call.name}
             # dump to match other function calling llm for now
             function_call_args_dict = proto.Message.to_dict(part.function_call)["args"]
@@ -610,11 +630,14 @@ def _completion_with_retry(
     *,
     max_retries: int,
     run_manager: Optional[CallbackManagerForLLMRun] = None,
+    wait_exponential_kwargs: Optional[dict[str, float]] = None,
     **kwargs: Any,
 ) -> Any:
     """Use tenacity to retry the completion call."""
     retry_decorator = create_retry_decorator(
-        max_retries=max_retries, run_manager=run_manager
+        max_retries=max_retries,
+        run_manager=run_manager,
+        wait_exponential_kwargs=wait_exponential_kwargs,
     )
 
     @retry_decorator
@@ -636,12 +659,15 @@ async def _acompletion_with_retry(
     generation_method: Callable,
     *,
     max_retries: int,
-    run_manager: Optional[CallbackManagerForLLMRun] = None,
+    run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+    wait_exponential_kwargs: Optional[dict[str, float]] = None,
     **kwargs: Any,
 ) -> Any:
     """Use tenacity to retry the completion call."""
     retry_decorator = create_retry_decorator(
-        max_retries=max_retries, run_manager=run_manager
+        max_retries=max_retries,
+        run_manager=run_manager,
+        wait_exponential_kwargs=wait_exponential_kwargs,
     )
 
     @retry_decorator
@@ -694,6 +720,12 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
     Key init args — client params:
         max_retries: int
             Max number of retries.
+        wait_exponential_kwargs: Optional[dict[str, float]]
+            Optional dictionary with parameters for wait_exponential:
+            - multiplier: Initial wait time multiplier (default: 1.0)
+            - min: Minimum wait time in seconds (default: 4.0)
+            - max: Maximum wait time in seconds (default: 10.0)
+            - exp_base: Exponent base to use (default: 2.0)
         credentials: Optional[google.auth.credentials.Credentials]
             The default custom credentials to use when making API calls. If not
             provided, credentials will be ascertained from the environment.
@@ -734,7 +766,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
 
         .. code-block:: python
 
-            AIMessage(content="J'adore programmer. \n", response_metadata={'is_blocked': False, 'safety_ratings': [{'category': 'HARM_CATEGORY_HATE_SPEECH', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_HARASSMENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}], 'citation_metadata': None, 'usage_metadata': {'prompt_token_count': 17, 'candidates_token_count': 7, 'total_token_count': 24}}, id='run-925ce305-2268-44c4-875f-dde9128520ad-0')
+            AIMessage(content="J'adore programmer. ", response_metadata={'is_blocked': False, 'safety_ratings': [{'category': 'HARM_CATEGORY_HATE_SPEECH', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_HARASSMENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}], 'citation_metadata': None, 'usage_metadata': {'prompt_token_count': 17, 'candidates_token_count': 7, 'total_token_count': 24}}, id='run-925ce305-2268-44c4-875f-dde9128520ad-0')
 
     Stream:
         .. code-block:: python
@@ -745,7 +777,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         .. code-block:: python
 
             AIMessageChunk(content='J', response_metadata={'is_blocked': False, 'safety_ratings': [], 'citation_metadata': None}, id='run-9df01d73-84d9-42db-9d6b-b1466a019e89')
-            AIMessageChunk(content="'adore programmer. \n", response_metadata={'is_blocked': False, 'safety_ratings': [{'category': 'HARM_CATEGORY_HATE_SPEECH', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_HARASSMENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}], 'citation_metadata': None}, id='run-9df01d73-84d9-42db-9d6b-b1466a019e89')
+            AIMessageChunk(content="'adore programmer. ", response_metadata={'is_blocked': False, 'safety_ratings': [{'category': 'HARM_CATEGORY_HATE_SPEECH', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_HARASSMENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}], 'citation_metadata': None}, id='run-9df01d73-84d9-42db-9d6b-b1466a019e89')
             AIMessageChunk(content='', response_metadata={'is_blocked': False, 'safety_ratings': [], 'citation_metadata': None, 'usage_metadata': {'prompt_token_count': 17, 'candidates_token_count': 7, 'total_token_count': 24}}, id='run-9df01d73-84d9-42db-9d6b-b1466a019e89')
 
         .. code-block:: python
@@ -758,7 +790,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
 
         .. code-block:: python
 
-            AIMessageChunk(content="J'adore programmer. \n", response_metadata={'is_blocked': False, 'safety_ratings': [{'category': 'HARM_CATEGORY_HATE_SPEECH', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_HARASSMENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}], 'citation_metadata': None, 'usage_metadata': {'prompt_token_count': 17, 'candidates_token_count': 7, 'total_token_count': 24}}, id='run-b7f7492c-4cb5-42d0-8fc3-dce9b293b0fb')
+            AIMessageChunk(content="J'adore programmer. ", response_metadata={'is_blocked': False, 'safety_ratings': [{'category': 'HARM_CATEGORY_HATE_SPEECH', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_HARASSMENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}], 'citation_metadata': None, 'usage_metadata': {'prompt_token_count': 17, 'candidates_token_count': 7, 'total_token_count': 24}}, id='run-b7f7492c-4cb5-42d0-8fc3-dce9b293b0fb')
 
     Async:
         .. code-block:: python
@@ -773,7 +805,57 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
 
         .. code-block:: python
 
-            AIMessage(content="J'adore programmer. \n", response_metadata={'is_blocked': False, 'safety_ratings': [{'category': 'HARM_CATEGORY_HATE_SPEECH', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_HARASSMENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}], 'citation_metadata': None, 'usage_metadata': {'prompt_token_count': 17, 'candidates_token_count': 7, 'total_token_count': 24}}, id='run-925ce305-2268-44c4-875f-dde9128520ad-0')
+            AIMessage(content="J'adore programmer. ", response_metadata={'is_blocked': False, 'safety_ratings': [{'category': 'HARM_CATEGORY_HATE_SPEECH', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_DANGEROUS_CONTENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_HARASSMENT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}, {'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'probability_label': 'NEGLIGIBLE', 'probability_score': 0.1, 'blocked': False, 'severity': 'HARM_SEVERITY_NEGLIGIBLE', 'severity_score': 0.1}], 'citation_metadata': None, 'usage_metadata': {'prompt_token_count': 17, 'candidates_token_count': 7, 'total_token_count': 24}}, id='run-925ce305-2268-44c4-875f-dde9128520ad-0')
+
+    Context Caching:
+        Context caching allows you to store and reuse content (e.g., PDFs, images) for faster processing.
+        The `cached_content` parameter accepts a cache name created via the Google Generative AI API with Vertex AI.
+        Below is an example of caching content from GCS and querying it.
+
+        Example:
+        This caches content from GCS and queries it.
+
+        .. code-block:: python
+
+            from google import genai
+            from google.genai.types import Content, CreateCachedContentConfig, HttpOptions, Part
+            from langchain_google_vertexai import ChatVertexAI
+            from langchain_core.messages import HumanMessage
+
+            client = genai.Client(http_options=HttpOptions(api_version="v1beta1"))
+
+            contents = [
+                Content(
+                    role="user",
+                    parts=[
+                        Part.from_uri(
+                            file_uri="gs://your-bucket/file1",
+                            mime_type="application/pdf",
+                        ),
+                        Part.from_uri(
+                            file_uri="gs://your-bucket/file2",
+                            mime_type="image/jpeg",
+                        ),
+                    ],
+                )
+            ]
+
+            cache = client.caches.create(
+                model="gemini-1.5-flash-001",
+                config=CreateCachedContentConfig(
+                    contents=contents,
+                    system_instruction="You are an expert content analyzer.",
+                    display_name="content-cache",
+                    ttl="300s",
+                ),
+            )
+
+            llm = ChatVertexAI(
+                model_name="gemini-1.5-flash-001",
+                cached_content=cache.name,
+            )
+            message = HumanMessage(content="Provide a summary of the key information across the content.")
+            llm.invoke([message])
 
     Tool calling:
         .. code-block:: python
@@ -814,7 +896,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
     Use Search with Gemini 2:
         .. code-block:: python
 
-            import google.cloud.aiplatform_v1beta1.types import Tool as VertexTool
+            from google.cloud.aiplatform_v1beta1.types import Tool as VertexTool
             llm = ChatVertexAI(model="gemini-2.0-flash-exp")
             resp = llm.invoke(
                 "When is the next total solar eclipse in US?",
@@ -867,7 +949,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
 
         .. code-block:: python
 
-            'The weather in this image appears to be sunny and pleasant. The sky is a bright blue with scattered white clouds, suggesting a clear and mild day. The lush green grass indicates recent rainfall or sufficient moisture. The absence of strong shadows suggests that the sun is high in the sky, possibly late afternoon. Overall, the image conveys a sense of tranquility and warmth, characteristic of a beautiful summer day. \n'
+            'The weather in this image appears to be sunny and pleasant. The sky is a bright blue with scattered white clouds, suggesting a clear and mild day. The lush green grass indicates recent rainfall or sufficient moisture. The absence of strong shadows suggests that the sun is high in the sky, possibly late afternoon. Overall, the image conveys a sense of tranquility and warmth, characteristic of a beautiful summer day.'
 
         You can also point to GCS files which is faster / more efficient because bytes are transferred back and forth.
 
@@ -890,7 +972,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
 
         .. code-block:: python
 
-            'The image is of five blueberry scones arranged on a piece of baking paper. \n\nHere is a list of what is in the picture:\n* **Five blueberry scones:** They are scattered across the parchment paper, dusted with powdered sugar.  \n* **Two cups of coffee:**  Two white cups with saucers. One appears full, the other partially drunk.\n* **A bowl of blueberries:** A brown bowl is filled with fresh blueberries, placed near the scones.\n* **A spoon:**  A silver spoon with the words "Let\'s Jam" rests on the paper.\n* **Pink peonies:** Several pink peonies lie beside the scones, adding a touch of color.\n* **Baking paper:** The scones, cups, bowl, and spoon are arranged on a piece of white baking paper, splattered with purple.  The paper is crinkled and sits on a dark surface. \n\nThe image has a rustic and delicious feel, suggesting a cozy and enjoyable breakfast or brunch setting. \n' # codespell:ignore brunch
+            'The image is of five blueberry scones arranged on a piece of baking paper. Here is a list of what is in the picture:* **Five blueberry scones:** They are scattered across the parchment paper, dusted with powdered sugar.  * **Two cups of coffee:**  Two white cups with saucers. One appears full, the other partially drunk. * **A bowl of blueberries:** A brown bowl is filled with fresh blueberries, placed near the scones.* **A spoon:**  A silver spoon with the words "Let\'s Jam" rests on the paper.* **Pink peonies:** Several pink peonies lie beside the scones, adding a touch of color.* **Baking paper:** The scones, cups, bowl, and spoon are arranged on a piece of white baking paper, splattered with purple.  The paper is crinkled and sits on a dark surface. The image has a rustic and delicious feel, suggesting a cozy and enjoyable breakfast or brunch setting.' # codespell:ignore brunch
 
     Video input:
         **NOTE**: Currently only supported for ``gemini-...-vision`` models.
@@ -970,7 +1052,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 {'token': ' programmer', 'logprob': -1.1922384146600962e-07, 'top_logprobs': []},
                 {'token': '.', 'logprob': -4.827636439586058e-05, 'top_logprobs': []},
                 {'token': ' ', 'logprob': -0.018011733889579773, 'top_logprobs': []},
-                {'token': '\n', 'logprob': -0.0008687592926435173, 'top_logprobs': []}
+                {'token': '\\n', 'logprob': -0.0008687592926435173, 'top_logprobs': []}
             ]
 
 
@@ -1091,12 +1173,12 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
 
     logprobs: Union[bool, int] = False
     """Whether to return logprobs as part of AIMessage.response_metadata.
-    
-    If False, don't return logprobs. If True, return logprobs for top candidate. 
+
+    If False, don't return logprobs. If True, return logprobs for top candidate.
     If int, return logprobs for top ``logprobs`` candidates.
-    
+
     **NOTE**: As of 10.28.24 this is only supported for gemini-1.5-flash models.
-    
+
     .. versionadded: 2.0.6
     """
     labels: Optional[Dict[str, str]] = None
@@ -1107,10 +1189,42 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
     """Whether to perform literal eval on string raw content.
     """
 
+    wait_exponential_kwargs: Optional[dict[str, float]] = None
+    """Optional dictionary with parameters for wait_exponential:
+        - multiplier: Initial wait time multiplier (default: 1.0)
+        - min: Minimum wait time in seconds (default: 4.0)
+        - max: Maximum wait time in seconds (default: 10.0)
+        - exp_base: Exponent base to use (default: 2.0)
+    """
+
+    model_kwargs: dict[str, Any] = Field(default_factory=dict)
+    """Holds any unexpected initialization parameters."""
+
     def __init__(self, *, model_name: Optional[str] = None, **kwargs: Any) -> None:
-        """Needed for mypy typing to recognize model_name as a valid arg."""
+        """Needed for mypy typing to recognize model_name as a valid arg
+        and for arg validation.
+        """
         if model_name:
             kwargs["model_name"] = model_name
+
+        # Get all valid field names, including aliases
+        valid_fields = set()
+        for field_name, field_info in self.model_fields.items():
+            valid_fields.add(field_name)
+            if hasattr(field_info, "alias") and field_info.alias is not None:
+                valid_fields.add(field_info.alias)
+
+        # Check for unrecognized arguments
+        for arg in kwargs:
+            if arg not in valid_fields:
+                suggestions = get_close_matches(arg, valid_fields, n=1)
+                suggestion = (
+                    f" Did you mean: '{suggestions[0]}'?" if suggestions else ""
+                )
+                logger.warning(
+                    f"Unexpected argument '{arg}' "
+                    f"provided to ChatVertexAI.{suggestion}"
+                )
         super().__init__(**kwargs)
 
     model_config = ConfigDict(
@@ -1126,6 +1240,14 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
     def get_lc_namespace(cls) -> List[str]:
         """Get the namespace of the langchain object."""
         return ["langchain", "chat_models", "vertexai"]
+
+    @model_validator(mode="before")
+    @classmethod
+    def build_extra(cls, values: dict[str, Any]) -> Any:
+        """Build extra kwargs from additional params that were passed in."""
+        all_required_field_names = get_pydantic_field_names(cls)
+        values = _build_model_kwargs(values, all_required_field_names)
+        return values
 
     @model_validator(mode="after")
     def validate_labels(self) -> Self:
@@ -1233,6 +1355,15 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
 
             gapic_response_schema = _convert_schema_dict_to_gapic(response_schema)
             params["response_schema"] = gapic_response_schema
+
+        audio_timestamp = kwargs.get("audio_timestamp", self.audio_timestamp)
+        if audio_timestamp is not None:
+            params["audio_timestamp"] = audio_timestamp
+
+        thinking_budget = kwargs.get("thinking_budget", self.thinking_budget)
+        if thinking_budget is not None:
+            params["thinking_config"] = {"thinking_budget": thinking_budget}
+        _ = params.pop("thinking_budget", None)
 
         return params
 
@@ -1522,6 +1653,8 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         response = _completion_with_retry(
             self.prediction_client.generate_content,
             max_retries=self.max_retries,
+            run_manager=run_manager,
+            wait_exponential_kwargs=self.wait_exponential_kwargs,
             request=request,
             metadata=self.default_metadata,
             **kwargs,
@@ -1538,6 +1671,8 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         response = await _acompletion_with_retry(
             self.async_prediction_client.generate_content,
             max_retries=self.max_retries,
+            run_manager=run_manager,
+            wait_exponential_kwargs=self.wait_exponential_kwargs,
             request=self._prepare_request_gemini(
                 messages=messages, stop=stop, **kwargs
             ),
@@ -1739,6 +1874,8 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         response_iter = _completion_with_retry(
             self.prediction_client.stream_generate_content,
             max_retries=self.max_retries,
+            run_manager=run_manager,
+            wait_exponential_kwargs=self.wait_exponential_kwargs,
             request=request,
             is_gemini=True,
             metadata=self.default_metadata,
@@ -1800,8 +1937,11 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
         response_iter = _acompletion_with_retry(
             self.async_prediction_client.stream_generate_content,
             max_retries=self.max_retries,
+            run_manager=run_manager,
+            wait_exponential_kwargs=self.wait_exponential_kwargs,
             request=request,
             is_gemini=True,
+            metadata=self.default_metadata,
             **kwargs,
         )
         total_lc_usage = None
@@ -1815,7 +1955,7 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
 
     def with_structured_output(
         self,
-        schema: Union[Dict, Type[BaseModel]],
+        schema: Union[Dict, Type[BaseModel], Type],
         *,
         include_raw: bool = False,
         method: Optional[Literal["json_mode"]] = None,
@@ -1921,40 +2061,50 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
 
         """  # noqa: E501
 
+        _ = kwargs.pop("strict", None)
         if kwargs:
             raise ValueError(f"Received unsupported arguments {kwargs}")
 
         parser: OutputParserLike
 
         if method == "json_mode":
-            if isinstance(schema, type):
-                # TODO: This gets the json schema of a pydantic model. It fails for
-                # nested models because the generated schema contains $refs that the
-                # gemini api doesn't support. We can implement a postprocessing function
-                # that takes care of this if necessary.
-                schema_json = schema.model_json_schema()
-                schema_json = replace_defs_in_schema(schema_json)
+            if isinstance(schema, type) and is_basemodel_subclass(schema):
+                if issubclass(schema, BaseModelV1):
+                    schema_json = schema.schema()
+                else:
+                    schema_json = schema.model_json_schema()
                 parser = PydanticOutputParser(pydantic_object=schema)
-                schema = schema_json
             else:
+                if is_typeddict(schema):
+                    schema_json = convert_to_json_schema(schema)
+                elif isinstance(schema, dict):
+                    schema_json = schema
+                else:
+                    raise ValueError(f"Unsupported schema type {type(schema)}")
                 parser = JsonOutputParser()
+
+            # Resolve refs in schema because they are not supported
+            # by the Gemini API.
+            schema_json = replace_defs_in_schema(schema_json)
+
             llm = self.bind(
                 response_mime_type="application/json",
-                response_schema=schema,
+                response_schema=schema_json,
                 ls_structured_output_format={
                     "kwargs": {"method": method},
-                    "schema": schema,
+                    "schema": schema_json,
                 },
             )
-
         else:
             tool_name = _get_tool_name(schema)
             if isinstance(schema, type) and is_basemodel_subclass(schema):
                 parser = PydanticToolsParser(tools=[schema], first_tool_only=True)
-            else:
+            elif is_typeddict(schema) or isinstance(schema, dict):
                 parser = JsonOutputKeyToolsParser(
                     key_name=tool_name, first_tool_only=True
                 )
+            else:
+                raise ValueError(f"Unsupported schema type {type(schema)}")
             tool_choice = tool_name if self._is_gemini_advanced else None
 
             try:
@@ -2094,6 +2244,9 @@ class ChatVertexAI(_VertexAICommon, BaseChatModel):
                 is_gemini=True,
                 usage_metadata={},
             )
+            # add model name if final chunk
+            if generation_info.get("finish_reason"):
+                message.response_metadata["model_name"] = self.model_name
             # is_blocked is part of "safety_ratings" list
             # but if it's True/False then chunks can't be marged
             generation_info.pop("is_blocked", None)
@@ -2108,14 +2261,23 @@ def _get_usage_metadata_gemini(raw_metadata: dict) -> Optional[UsageMetadata]:
     input_tokens = raw_metadata.get("prompt_token_count", 0)
     output_tokens = raw_metadata.get("candidates_token_count", 0)
     total_tokens = raw_metadata.get("total_token_count", 0)
+    thought_tokens = raw_metadata.get("thoughts_token_count", 0)
     if all(count == 0 for count in [input_tokens, output_tokens, total_tokens]):
         return None
     else:
-        return UsageMetadata(
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            total_tokens=total_tokens,
-        )
+        if thought_tokens > 0:
+            return UsageMetadata(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                output_token_details={"reasoning": thought_tokens},
+            )
+        else:
+            return UsageMetadata(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
 
 
 def _get_usage_metadata_non_gemini(raw_metadata: dict) -> Optional[UsageMetadata]:

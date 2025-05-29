@@ -47,12 +47,14 @@ _GoogleSearchRetrievalLike = Union[
     gapic.GoogleSearchRetrieval,
     Dict[str, Any],
 ]
+_GoogleSearchLike = Union[gapic.Tool.GoogleSearch, Dict[str, Any]]
 _RetrievalLike = Union[gapic.Retrieval, Dict[str, Any]]
 
 
 class _ToolDictLike(TypedDict):
     function_declarations: Optional[List[_FunctionDeclarationLike]]
     google_search_retrieval: Optional[_GoogleSearchRetrievalLike]
+    google_search: Optional[_GoogleSearchLike]
     retrieval: Optional[_RetrievalLike]
 
 
@@ -112,7 +114,7 @@ def _format_json_schema_to_gapic(
     """Format a JSON schema from a Pydantic V2 BaseModel to gapic."""
     converted_schema: Dict[str, Any] = {}
     for key, value in schema.items():
-        if key == "definitions":
+        if key == "$defs":
             continue
         elif key == "items":
             converted_schema["items"] = _format_json_schema_to_gapic(
@@ -157,7 +159,10 @@ def _format_json_schema_to_gapic(
 def _dict_to_gapic_schema(
     schema: Dict[str, Any], pydantic_version: str = "v1"
 ) -> gapic.Schema:
+    # Resolve refs in schema because $refs and $defs are not supported
+    # by the Gemini API.
     dereferenced_schema = dereference_refs(schema)
+
     if pydantic_version == "v1":
         formatted_schema = _format_json_schema_to_gapic_v1(dereferenced_schema)
     else:
@@ -219,16 +224,25 @@ def _format_pydantic_to_function_declaration(
 def _format_dict_to_function_declaration(
     tool: Union[FunctionDescription, Dict[str, Any]],
 ) -> gapic.FunctionDeclaration:
+    pydantic_version_v2 = False
+
     # Ensure we send "anyOf" parameters through pydantic v2 schema parsing
-    pydantic_version = None
-    if isinstance(tool, dict):
-        properties = tool.get("parameters", {}).get("properties", {}).values()
+    def _check_v2(parameters):
+        properties = parameters.get("properties", {}).values()
         for property in properties:
             if "anyOf" in property:
-                pydantic_version = "v2"
-    if pydantic_version:
+                return True
+            if "parameters" in property:
+                return _check_v2(property["parameters"])
+            if "items" in property:
+                return _check_v2(property["items"])
+        return False
+
+    if isinstance(tool, dict):
+        pydantic_version_v2 = _check_v2(tool.get("parameters", {}))
+    if pydantic_version_v2:
         parameters = _dict_to_gapic_schema(
-            tool.get("parameters", {}), pydantic_version=pydantic_version
+            tool.get("parameters", {}), pydantic_version="v2"
         )
     else:
         parameters = _dict_to_gapic_schema(tool.get("parameters", {}))
@@ -299,6 +313,7 @@ def _format_to_gapic_tool(tools: _ToolsType) -> gapic.Tool:
                 for f in [
                     "function_declarations",
                     "google_search_retrieval",
+                    "google_search",
                     "retrieval",
                 ]
             ):
@@ -323,6 +338,10 @@ def _format_to_gapic_tool(tools: _ToolsType) -> gapic.Tool:
             if "google_search_retrieval" in tool:
                 gapic_tool.google_search_retrieval = gapic.GoogleSearchRetrieval(
                     tool["google_search_retrieval"]
+                )
+            if "google_search" in tool:
+                gapic_tool.google_search = gapic.Tool.GoogleSearch(
+                    tool["google_search"]
                 )
             if "retrieval" in tool:
                 gapic_tool.retrieval = gapic.Retrieval(tool["retrieval"])
@@ -451,6 +470,14 @@ def _tool_choice_to_tool_config(
             allowed_function_names = tool_choice["function_calling_config"].get(
                 "allowed_function_names"
             )
+        elif (
+            "type" in tool_choice
+            and tool_choice["type"] == "function"
+            and "function" in tool_choice
+            and "name" in tool_choice["function"]
+        ):
+            mode = gapic.FunctionCallingConfig.Mode.ANY
+            allowed_function_names = [tool_choice["function"]["name"]]
         else:
             raise ValueError(
                 f"Unrecognized tool choice format:\n\n{tool_choice=}\n\nShould match "

@@ -80,6 +80,22 @@ def test_init() -> None:
             "ls_stop": ["bar"],
         }
 
+    # test initialization with an invalid argument to check warning
+    with patch("langchain_google_vertexai.chat_models.logger.warning") as mock_warning:
+        llm = ChatVertexAI(
+            model_name="gemini-pro",
+            project="test-project",
+            safety_setting={
+                "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_LOW_AND_ABOVE"
+            },  # Invalid arg
+        )
+        assert llm.model_name == "gemini-pro"
+        assert llm.project == "test-project"
+        mock_warning.assert_called_once()
+        call_args = mock_warning.call_args[0][0]
+        assert "Unexpected argument 'safety_setting'" in call_args
+        assert "Did you mean: 'safety_settings'?" in call_args
+
 
 @pytest.mark.parametrize(
     "model,location",
@@ -955,15 +971,27 @@ def test_parser_multiple_tools():
 
 
 def test_generation_config_gemini() -> None:
-    model = ChatVertexAI(model_name="gemini-pro", temperature=0.2, top_k=3)
+    model = ChatVertexAI(
+        model_name="gemini-pro",
+        temperature=0.2,
+        top_k=3,
+        frequency_penalty=0.2,
+        presence_penalty=0.6,
+    )
     generation_config = model._generation_config_gemini(
-        temperature=0.3, stop=["stop"], candidate_count=2
+        temperature=0.3,
+        stop=["stop"],
+        candidate_count=2,
+        frequency_penalty=0.9,
+        presence_penalty=0.8,
     )
     expected = GenerationConfig(
         stop_sequences=["stop"],
         temperature=0.3,
         top_k=3,
         candidate_count=2,
+        frequency_penalty=0.9,
+        presence_penalty=0.8,
     )
     assert generation_config == expected
 
@@ -1178,6 +1206,40 @@ def test_init_client_with_custom_base_url() -> None:
         assert transport == "rest"
 
 
+def test_init_client_with_custom_model_kwargs() -> None:
+    llm = ChatAnthropicVertex(
+        project="test-project",
+        location="test-location",
+        model_kwargs={"thinking": {"type": "enabled", "budget_tokens": 1024}},
+    )
+    assert llm.model_kwargs == {"thinking": {"type": "enabled", "budget_tokens": 1024}}
+
+    default_params = llm._default_params
+    assert default_params["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+
+
+def test_model_kwargs_chat_vertex() -> None:
+    """Test we can transfer unknown params to model_kwargs."""
+    llm = ChatVertexAI(
+        model="my-model",
+        convert_system_message_to_human=True,
+        model_kwargs={"foo": "bar"},
+    )
+    assert llm.model_name == "my-model"
+    assert llm.convert_system_message_to_human is True
+    assert llm.model_kwargs == {"foo": "bar"}
+
+    with pytest.warns(match="transferred to model_kwargs"):
+        llm = ChatVertexAI(
+            model="my-model",
+            convert_system_message_to_human=True,
+            foo="bar",
+        )
+    assert llm.model_name == "my-model"
+    assert llm.convert_system_message_to_human is True
+    assert llm.model_kwargs == {"foo": "bar"}
+
+
 def test_anthropic_format_output() -> None:
     """Test format output handles different content structures correctly."""
 
@@ -1231,6 +1293,74 @@ def test_anthropic_format_output() -> None:
     assert len(message.tool_calls) == 1
     assert message.tool_calls[0]["name"] == "calculator"
     assert message.tool_calls[0]["args"] == {"number": 42}
+    assert message.usage_metadata == {
+        "input_tokens": 2,
+        "output_tokens": 1,
+        "total_tokens": 3,
+        "cache_creation_input_tokens": 1,
+        "cache_read_input_tokens": 1,
+    }
+
+
+def test_anthropic_format_output_with_chain_of_thoughts() -> None:
+    """Test format output handles chain of thoughts correctly."""
+
+    @dataclass
+    class Usage:
+        input_tokens: int
+        output_tokens: int
+        cache_creation_input_tokens: Optional[int]
+        cache_read_input_tokens: Optional[int]
+
+    @dataclass
+    class Message:
+        def model_dump(self):
+            return {
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "Thoughts of the model...",
+                        "signature": "thought-signatire",
+                    },
+                    {
+                        "type": "redacted_thinking",
+                        "data": "redacted-thoughts-data",
+                    },
+                    {
+                        "type": "text",
+                        "text": "Final output the model",
+                    },
+                ],
+                "model": "baz",
+                "role": "assistant",
+                "usage": Usage(
+                    input_tokens=2,
+                    output_tokens=1,
+                    cache_creation_input_tokens=1,
+                    cache_read_input_tokens=1,
+                ),
+                "type": "message",
+            }
+
+        usage: Usage
+
+    test_msg = Message(
+        usage=Usage(
+            input_tokens=2,
+            output_tokens=1,
+            cache_creation_input_tokens=1,
+            cache_read_input_tokens=1,
+        )
+    )
+
+    model = ChatAnthropicVertex(project="test-project", location="test-location")
+    result = model._format_output(test_msg)
+
+    message = result.generations[0].message
+    print(message)
+    assert isinstance(message, AIMessage)
+    assert len(message.content) == 3
+    assert message.content == test_msg.model_dump()["content"]
     assert message.usage_metadata == {
         "input_tokens": 2,
         "output_tokens": 1,

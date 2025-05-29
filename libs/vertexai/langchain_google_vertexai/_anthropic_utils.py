@@ -1,3 +1,4 @@
+import base64
 import re
 import warnings
 from typing import (
@@ -16,6 +17,7 @@ from typing import (
     cast,
 )
 
+import validators
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -30,6 +32,11 @@ from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import BaseModel
 
+from langchain_google_vertexai._image_utils import (
+    ImageBytesLoader,
+)
+from langchain_google_vertexai._utils import load_image_from_gcs
+
 if TYPE_CHECKING:
     from anthropic.types import (
         RawMessageStreamEvent,  # type: ignore[unused-ignore, import-not-found]
@@ -43,20 +50,52 @@ _message_type_lookups = {
 }
 
 
-def _format_image(image_url: str) -> Dict:
+def _format_image(image_url: str, project: Optional[str]) -> Dict:
     """Formats a message image to a dict for anthropic api."""
-    regex = r"^data:(?P<media_type>image/.+);base64,(?P<data>.+)$"
+    regex = r"^data:(?P<media_type>(?:image|application)/.+);base64,(?P<data>.+)$"
     match = re.match(regex, image_url)
-    if match is None:
-        raise ValueError(
-            "Anthropic only supports base64-encoded images currently."
-            " Example: data:image/png;base64,'/9j/4AAQSk'..."
+    if match:
+        return {
+            "type": "base64",
+            "media_type": match.group("media_type"),
+            "data": match.group("data"),
+        }
+    elif validators.url(image_url):
+        loader = ImageBytesLoader(project=project)
+        image_bytes = loader.load_bytes(image_url)
+        raw_mime_type = image_url.split(".")[-1].lower()
+        doc_type = "application" if raw_mime_type == "pdf" else "image"
+        mime_type = (
+            f"{doc_type}/jpeg"
+            if raw_mime_type == "jpg"
+            else f"{doc_type}/{raw_mime_type}"
         )
-    return {
-        "type": "base64",
-        "media_type": match.group("media_type"),
-        "data": match.group("data"),
-    }
+        return {
+            "type": "base64",
+            "media_type": mime_type,
+            "data": base64.b64encode(image_bytes).decode("ascii"),
+        }
+    elif image_url.startswith("gs://"):
+        # Gets image and encodes to base64.
+        loader = ImageBytesLoader(project=project)
+        part = loader.load_part(image_url)
+        if part.file_data.mime_type:
+            mime_type = part.file_data.mime_type
+            image_data = load_image_from_gcs(image_url, project=project).data
+        else:
+            mime_type = part.inline_data.mime_type
+            image_data = part.inline_data.data
+        return {
+            "type": "base64",
+            "media_type": mime_type,
+            "data": base64.b64encode(image_data).decode("ascii"),
+        }
+    else:
+        raise ValueError(
+            "Anthropic only supports base64-encoded images and urls currently."
+            " Example: data:image/png;base64,'/9j/4AAQSk'..."
+            " Example: https://your-valid-image-url.png"
+        )
 
 
 def _get_cache_control(message: BaseMessage) -> Optional[Dict[str, Any]]:
@@ -74,7 +113,9 @@ def _format_text_content(text: str) -> Dict[str, Union[str, Dict[str, Any]]]:
     return content
 
 
-def _format_message_anthropic(message: Union[HumanMessage, AIMessage, SystemMessage]):
+def _format_message_anthropic(
+    message: Union[HumanMessage, AIMessage, SystemMessage], project: Optional[str]
+):
     """Format a message for Anthropic API.
 
     Args:
@@ -121,10 +162,34 @@ def _format_message_anthropic(message: Union[HumanMessage, AIMessage, SystemMess
                         content.append(new_block)
                     continue
 
+                if block["type"] == "thinking":
+                    content.append(
+                        {
+                            k: v
+                            for k, v in block.items()
+                            if k in ("type", "thinking", "cache_control", "signature")
+                        }
+                    )
+                    continue
+
+                if block["type"] == "redacted_thinking":
+                    content.append(
+                        {
+                            k: v
+                            for k, v in block.items()
+                            if k in ("type", "cache_control", "data")
+                        }
+                    )
+                    continue
+
                 if block["type"] == "image_url":
                     # convert format
-                    source = _format_image(block["image_url"]["url"])
-                    content.append({"type": "image", "source": source})
+                    source = _format_image(block["image_url"]["url"], project)
+                    if source["media_type"] == "application/pdf":
+                        doc_type = "document"
+                    else:
+                        doc_type = "image"
+                    content.append({"type": doc_type, "source": source})
                     continue
 
                 if block["type"] == "tool_use":
@@ -154,6 +219,7 @@ def _format_message_anthropic(message: Union[HumanMessage, AIMessage, SystemMess
 
 def _format_messages_anthropic(
     messages: List[BaseMessage],
+    project: Optional[str],
 ) -> Tuple[Optional[Dict[str, Any]], List[Dict]]:
     """Formats messages for anthropic."""
     system_messages: Optional[Dict[str, Any]] = None
@@ -164,12 +230,12 @@ def _format_messages_anthropic(
         if message.type == "system":
             if i != 0:
                 raise ValueError("System message must be at beginning of message list.")
-            fm = _format_message_anthropic(message)
+            fm = _format_message_anthropic(message, project)
             if fm:
                 system_messages = fm
             continue
 
-        fm = _format_message_anthropic(message)
+        fm = _format_message_anthropic(message, project)
         if not fm:
             continue
         formatted_messages.append(fm)
@@ -308,6 +374,20 @@ def _make_message_chunk_from_anthropic_event(
                 content_block["index"] = event.index
                 content_block["type"] = "text"
                 message_chunk = AIMessageChunk(content=[content_block])
+        elif event.delta.type == "thinking_delta":
+            content_block = event.delta.model_dump()
+            if "text" in content_block and content_block["text"] is None:
+                content_block.pop("text")
+            content_block["index"] = event.index
+            content_block["type"] = "thinking"
+            message_chunk = AIMessageChunk(content=[content_block])
+        elif event.delta.type == "signature_delta":
+            content_block = event.delta.model_dump()
+            if "text" in content_block and content_block["text"] is None:
+                content_block.pop("text")
+            content_block["index"] = event.index
+            content_block["type"] = "thinking"
+            message_chunk = AIMessageChunk(content=[content_block])
         elif event.delta.type == "input_json_delta":
             content_block = event.delta.model_dump()
             content_block["index"] = event.index
@@ -345,3 +425,20 @@ def _tools_in_params(params: dict) -> bool:
     return "tools" in params or (
         "extra_body" in params and params["extra_body"].get("tools")
     )
+
+
+def _thinking_in_params(params: dict) -> bool:
+    return params.get("thinking", {}).get("type") == "enabled"
+
+
+def _documents_in_params(params: dict) -> bool:
+    for message in params.get("messages", []):
+        if isinstance(message.get("content"), list):
+            for block in message["content"]:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "document"
+                    and block.get("citations", {}).get("enabled")
+                ):
+                    return True
+    return False
