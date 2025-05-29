@@ -247,6 +247,10 @@ class _VertexAICommon(_VertexAIBase):
     def max_tokens(self) -> int | None:
         return self.max_output_tokens
 
+    @max_tokens.setter
+    def max_tokens(self, value: Optional[int]) -> None:
+        self.max_output_tokens = value
+
     @property
     def _identifying_params(self) -> Dict[str, Any]:
         """Gets the identifying parameters."""
